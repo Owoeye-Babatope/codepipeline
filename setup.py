@@ -5,7 +5,7 @@ setup(
     name='Selenium_Wine_detail_Scrapper', ## This will be the name your package will be published with
     version='0.0.1', 
     description='This package contains a main scrapper file for scrapping the ocado web',
-    url='https://github.com/IvanYingX/project_structure_pypi.git', # Add the URL of your github repo if published 
+    url='https://github.com/Owoeye-Babatope/codepipeline.git', # Add the URL of your github repo if published 
                                                                    # in GitHub
     author='Owoeye Babatope', # Your name
     license='MIT',

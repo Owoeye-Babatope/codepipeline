@@ -1,4 +1,5 @@
 
+import boto3
 import sys
 import json
 import urllib
@@ -7,6 +8,9 @@ import os
 import time
 import urllib.request
 import typing
+import psycopg2
+psycopg2.paramstyle = 'named'
+from botocore.errorfactory import ClientError
 from selenium import webdriver
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
@@ -203,7 +207,11 @@ class Scrapper:
         try:
             #print('\ncheck\n')
             #self.driver.implicitly_wait(5)
-            all_wines = self.get_all_wines()[0]
+
+            all  = self.get_all_wines()
+            all_wines = []
+            if(len(all) > 0):
+                all_wines = self.get_all_wines()[0]
             #wine_number = 18
             #all_wines[wine_number].click()
             all_wines[wine].click()
@@ -280,8 +288,11 @@ class Scrapper:
             . Check the folders first for what data is available to avoid unnecessary opening the page to find that it exists already
             .
         '''
+
+        s3 = boto3.resource('s3')
+        s3c = boto3.client('s3')
         collection = {}
-        print(f"The Webpage title is {self.driver.title}")
+        # print(f"The Webpage title is {self.driver.title}")
 
         # Since we are interested in the wines available we find its link and click to get its page
         word_search = search_word
@@ -293,7 +304,7 @@ class Scrapper:
         wines_xpath = get_all_wines[1]
         print(wines_xpath)
         number_of_wines = self.number_of_all_wines()
-        print(f"\nnumber of wines: {number_of_wines}\n")
+        # print(f"\nnumber of wines: {number_of_wines}\n")
 
         # We wait some 3 secs 
         self.wait(3)
@@ -322,7 +333,7 @@ class Scrapper:
                 class_name = self.driver.find_element(By.XPATH, class_name_xpath).get_attribute('class')
                 
             if (class_name == 'fops-item fops-item--cluster' or class_name == 'fops-item fops-item--featured'):
-                print(class_name)
+                #print(class_name)
                 name_pre_xpath = f'{class_name_xpath}/div[2]/div[1]/a/div[1]/div[2]/h4'
                 name_of_wine = self.find_element_xpath(name_pre_xpath).text
                 print(f'Name: {name_of_wine}, wine_number: {wine}')
@@ -331,25 +342,59 @@ class Scrapper:
                 
                 directory_name = name_of_wine + f'/'
                 path = os.path.join(parent_dir, directory_name)
+                
                 try:
-                    os.mkdir(path)
-                    file_path = path +'data.json'
-                    img_folder = '' # It needs to be defined at this level to be accessible outside the block
-                    try:
-                        img_folder = path + 'images/'
-                        os.mkdir(img_folder)
-                    except:
-                        print('error occurred at image folder creation')
+
+                    # s3_img_path = f'{search_word}/{name_of_wine}/images/{name_of_wine}.png'
+                    # if it exists it runs successfully 
                     
-                    store = self.get_prod_details(wine)
-                    img_path = img_folder + f"{name_of_wine}.png"
-                    urllib.request.urlretrieve(store['img_link'], img_path) 
-                    print(f'image downloaded successfully')
-                    with open(file_path, 'w') as file:
-                        stringed_file = json.dumps(store)
-                        file.write(stringed_file) # use `json.loads` to do the reverse
+
+                    # os.mkdir(path)
+                    # file_path = path +'data.json'
+                    # img_folder = '' # It needs to be defined at this level to be accessible outside the block
+                    # try:
+                    #     img_folder = path + 'images/'
+                    #     os.mkdir(img_folder)
+                    # except:
+                    #     print('error occurred at image folder creation')
+                    # print('\n here \n')
+                    
+                    img_folder = path + 'images/'
+                    s3_img_path = f'{search_word}/{name_of_wine}/images/{name_of_wine}.png'
+                    try:
+                        s3c.head_object(Bucket='aicore-scrapped-data', Key= s3_img_path) # Confirm that the file exist in s3 else log it 
+                        print(f'File originally existed')
+                    except:
+                        
+                        store = self.get_prod_details(wine)
+                        #print('\n here now \n')
+                        if (len(store) > 0):
+
+                            img_path = img_folder + f"{name_of_wine}.png"
+                            (filename , header) = urllib.request.urlretrieve(store['img_link'])
+                            #print('\n here \n'*2) 
+
+                            data = open(filename, 'rb')
+                            #print('\n here \n'*3)
+                            s3.Bucket('aicore-scrapped-data').put_object(Key=s3_img_path, Body=data)
+
+                            data = store
+                            if not (self.check_data_exist_on_table(search_word, data)): # prevent code from relogging in sql
+                                self.sql_(search_word, data) # log data in sql
+                            obj = s3.Object('aicore-scrapped-data',f'{search_word}/{name_of_wine}/data.json') 
+                            obj.put(Body=json.dumps(data))
+                        #print(f'image and data uploaded successfully')
+                        
+                        # pass
+
+
+                    #print(f'File originally existed')
+                    # with open(file_path, 'w') as file:
+                    #     stringed_file = json.dumps(store)
+                    #     file.write(stringed_file) # use `json.loads` to do the reverse
+                        
                 except:
-                    print(f'file exists for {name_of_wine}')
+                    print(f'file exists for {name_of_wine} in s3 or folder')
                     continue
                     
                 
@@ -359,7 +404,173 @@ class Scrapper:
         self.driver.close()
 
 
+    def check_data_exist_on_table(self, table_name: str, data: dict):
+        from sqlalchemy import create_engine, inspect, create_engine, MetaData, Table, Column, Integer, String, DateTime
+        from sqlalchemy.orm import  declarative_base, sessionmaker
+        from datetime import datetime
+
+        HOST = 'aicore-postgres.cugn6azr5y0m.us-east-1.rds.amazonaws.com'
+        USER = 'postgres_aicore'
+        PASSWORD = 'postgres'
+        DATABASE = 'postgres'
+        PORT = 5432
+        DATABASE_TYPE = 'postgresql'
+        DBAPI = 'psycopg2'
+        
+        joined_table_name = ''
+        ii = ''
+        if ' ' in table_name:
+            splited_table_name = table_name.split(' ')
+            for each in splited_table_name:
+                joined_table_name = joined_table_name + each
+        else:
+            joined_table_name = table_name
+
+        engine = create_engine(f"{DATABASE_TYPE}+{DBAPI}://{USER}:{PASSWORD}@{HOST}:{PORT}/{DATABASE}", echo=True)
+        Session = sessionmaker(bind = engine)
+        session = Session()
+        data = data
+        ii = str(data['item_id'])
+        with engine.connect() as con: 
+            # Get all data 
+            #rs = con.execute(f"SELECT * FROM {joined_table_name} WHERE id = data['item_id']")
+            
+            # print(type(ii) == type('25f7489d-9bdf-465c-8703-1433aadba25c'))
+            # ex = con.execute( f"SELECT EXISTS(SELECT 1 FROM {joined_table_name} WHERE id={ii})")        
+            ex = con.execute(f"SELECT TRUE FROM {joined_table_name} WHERE id =  %(i)s LIMIT 1", {'i' : ii})        
+
+            #print(ex)
+            # for row in rs:
+            #     print (row[0]) # print each id
+            #     print('\n\n')
+        return (ex.first()[0])
+
+
+    def sql_(self, table_name: str, data: dict):
+        from sqlalchemy import create_engine, inspect, create_engine, MetaData, Table, Column, Integer, String, DateTime
+        from sqlalchemy.orm import  declarative_base, sessionmaker
+        # import pandas as pd
+        from datetime import datetime
+        joined_table_name = ''
+        
+        if ' ' in table_name:
+            splited_table_name = table_name.split(' ')
+            for each in splited_table_name:
+                joined_table_name = joined_table_name + each
+        else:
+            joined_table_name = table_name
+
+        HOST = 'aicore-postgres.cugn6azr5y0m.us-east-1.rds.amazonaws.com'
+        USER = 'postgres_aicore'
+        PASSWORD = 'postgres'
+        DATABASE = 'postgres'
+        PORT = 5432
+        DATABASE_TYPE = 'postgresql'
+        DBAPI = 'psycopg2'
+
+        engine = create_engine(f"{DATABASE_TYPE}+{DBAPI}://{USER}:{PASSWORD}@{HOST}:{PORT}/{DATABASE}", echo=True)
+        Session = sessionmaker(bind = engine)
+        session = Session()
+
+        # with engine.connect() as con:            
+        #             rs = con.execute('SELECT * FROM redwine')
+
+        #             for row in rs:
+        #                 print (row[0])
+        #                 print('\n\n')
+        # return rs
+
+        Base = declarative_base()
+        # print(f'\n\n\n\n{joined_table_name}\n\n\n\n')
+        class Wine(Base):
+            __tablename__ = joined_table_name
+            
+            id = Column(String(), primary_key=True)
+            wine_name = Column(String()) 
+            price = Column(String())
+            country_of_origin = Column(String())
+            alcohol_by_volume = Column(String())
+            image_link = Column(String())
+            description = Column(String())
+            date_created = Column(DateTime(), default = datetime.utcnow)
+        created = False
+        
+        try:
+            # print(f'\n\ntry sql_   {joined_table_name}\n\n\n')
+            Base.metadata.create_all(engine)
+            created = True
+        except:
+            created = True
+            
+        if created:
+            print('logging to sql ...')
+            wine = Wine(
+                id= data['item_id'],
+                wine_name = data['name'],
+                price = data['price'],
+                description = data['description'],
+                country_of_origin = data['country_of_origin'],
+                alcohol_by_volume = data['alcoho_by_volume'],
+                image_link = data['img_link'],
+                )
+            session.add(wine)
+            '''
+            from sqlalchemy.sql import text
+            with engine.connect() as con:
+
+                data = ( { "id": 1, "title": "The Hobbit", "primary_author": "Tolkien" },
+                         { "id": 2, "title": "The Silmarillion", "primary_author": "Tolkien" },
+                )
+
+                statement = text("""INSERT INTO book(id, title, primary_author) VALUES(:id, :title, :primary_author)""")
+
+                for line in data:
+                    con.execute(statement, **line)
+
+
+
+                with engine.connect() as con:            
+                    rs = con.execute('SELECT * FROM book')
+
+                    for row in rs:
+                        print row
+
+                Out[*]:
+                (4, u'The Hobbit', u'Tolkien')
+                (5, u'The Silmarillion', u'Tolkien')
+
+        '''
+
+
+
+
+            session.commit()
+            print('logged on posgres')
+        return ('logged')
+
 if __name__ == '__main__':
+    # sys.path.append('C:\\Users\\Sean Kelly\\Documents\\New folder (3)\\Data Science\\Aicore\\codepipeline')
+    # from testt import test_scrapper as ts
+    # print(os.path.dirname(os.getcwd()))
+    # print(os.getcwd())
+
+
+
+
+
+
+
+
+    # Let's use Amazon S3
+    #data = open('Barefoot.png', 'rb')
+    #s3.Bucket('aicore-scrapped-data').put_object(Key='Newfolder/test.jpg', Body=data)
+    # s3 = boto3.client('s3')
+    # res = s3.head_object(Bucket='aicore-scrapped-data', Key='Newfolder/test.jpg')
+    # print(res)
+    # data = {"item_id": "4d1642c3-ea8f-4505-ae71-eaeecc5baa5d", "name": "Barefoot Pinot Grigio 75cl", "price": "\u00a37", "description": "Barefoot Pinot Grigio is crisp and full of citrus and peach flavours. Goes well with chicken, seafood, spicy pasta and pizzas.", "country_of_origin": "Wine of California, U.S.A, Silver Medal 2014 Concours Mondial de Bruxelles U.S.A", "alcoho_by_volume": "12", "img_link": "https://www.ocado.com//productImages/641/64101011_0_640x640.jpg?identifier=4ff784e778fd588bd01679535d6a4c2d"}
+    
+    
     instance1 = Scrapper()
+
     instance1.get_text_details('red wine')
     instance1.close()
